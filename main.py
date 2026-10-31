@@ -22,7 +22,7 @@ KEYS_FILE = "keys_db.json"
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # Global states
-ONLINE_DEVICES = {}  # dev_code: {"name": str, "room": str, "last_seen": timestamp, "target": str}
+ONLINE_DEVICES = {}  # dev_code: {"name": str, "room": str, "last_seen": timestamp, "real_target": str}
 ACTIVE_KEYS = {}     # key_str: {"dev_code": str, "matches_left": int, "total_matches": int}
 USER_SESSIONS = {}   # tg_user_id: key_str
 
@@ -59,7 +59,68 @@ def save_keys():
     except Exception:
         pass
 
-# ==================== SUPABASE LOBBY LISTENER ====================
+# ==================== SUPABASE LOBBY & STATE LISTENER ====================
+ROOM_SOCKETS = {}  # room_id: ws_connection
+
+async def connect_and_listen_room(room_id: str, dev_code: str):
+    ws_url = SUPABASE_URL.replace("https://", "wss://") + f"/realtime/v1/websocket?apikey={SUPABASE_KEY}&vsn=1.0.0"
+    while True:
+        try:
+            async with websockets.connect(ws_url, ping_interval=20) as ws:
+                ROOM_SOCKETS[room_id] = ws
+                
+                # Join room topic
+                join_msg = {
+                    "topic": f"realtime:{room_id}",
+                    "event": "phx_join",
+                    "payload": {"config": {"broadcast": {"acknowledge_broadcasts": True}}},
+                    "ref": "1"
+                }
+                await ws.send(json.dumps(join_msg))
+                await asyncio.sleep(0.3)
+                
+                # Initial ping to get state immediately
+                await send_ping(ws, room_id)
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        if data.get("event") == "broadcast":
+                            payload = data.get("payload", {})
+                            inner_event = payload.get("event")
+                            inner_payload = payload.get("payload", {})
+                            msg = inner_payload.get("msg", "")
+
+                            # Read live broadcast state from phone (STATE|...|protect:red)
+                            if inner_event == "state" and "protect:" in msg:
+                                parts = msg.split("|")
+                                for p in parts:
+                                    if p.startswith("protect:"):
+                                        target_color = p.split(":")[1].strip().upper()
+                                        if dev_code in ONLINE_DEVICES:
+                                            ONLINE_DEVICES[dev_code]["real_target"] = target_color
+                    except Exception:
+                        pass
+        except Exception:
+            ROOM_SOCKETS.pop(room_id, None)
+            await asyncio.sleep(3)
+
+async def send_ping(ws, room_id):
+    try:
+        ping_msg = {
+            "topic": f"realtime:{room_id}",
+            "event": "broadcast",
+            "payload": {
+                "type": "broadcast",
+                "event": "ping",
+                "payload": {"msg": "PING"}
+            },
+            "ref": "ping_ref"
+        }
+        await ws.send(json.dumps(ping_msg))
+    except Exception:
+        pass
+
 async def supabase_lobby_listener():
     ws_url = SUPABASE_URL.replace("https://", "wss://") + f"/realtime/v1/websocket?apikey={SUPABASE_KEY}&vsn=1.0.0"
     while True:
@@ -82,33 +143,36 @@ async def supabase_lobby_listener():
                             inner_payload = payload.get("payload", {})
                             msg = inner_payload.get("msg", "")
 
-                            # Format: HOST|Model|room-xyz|DEV-ABCDEF
+                            # HOST announce
                             if inner_event == "host" and msg.startswith("HOST|"):
                                 parts = msg.split("|")
                                 if len(parts) >= 4:
                                     dev_name = parts[1]
                                     room_id = parts[2]
                                     dev_code = parts[3].strip()
-                                    
-                                    current_target = "OFF"
-                                    if dev_code in ONLINE_DEVICES:
-                                        current_target = ONLINE_DEVICES[dev_code].get("target", "OFF")
+
+                                    first_time = dev_code not in ONLINE_DEVICES
+                                    curr_target = ONLINE_DEVICES.get(dev_code, {}).get("real_target", "OFF")
 
                                     ONLINE_DEVICES[dev_code] = {
                                         "name": dev_name,
                                         "room": room_id,
                                         "last_seen": time.time(),
-                                        "target": current_target
+                                        "real_target": curr_target
                                     }
 
-                            # When match ends (APK broadcast: MATCH_END|DEV-ABCDEF)
-                            elif inner_event == "match_end" or (inner_event == "host" and msg.startswith("MATCH_END|")):
+                                    # Connect to room websocket agar room-xyz hai
+                                    if first_time and room_id.startswith("room-"):
+                                        asyncio.create_task(connect_and_listen_room(room_id, dev_code))
+
+                            # Match complete event
+                            elif inner_event == "host" and msg.startswith("MATCH_END|"):
                                 parts = msg.split("|")
                                 if len(parts) >= 2:
                                     dev_code = parts[1].strip()
                                     deduct_match(dev_code)
 
-                            # Device closed app
+                            # Device closed game
                             elif inner_event == "bye":
                                 parts = msg.split("|")
                                 if len(parts) >= 2:
@@ -131,9 +195,9 @@ def deduct_match(dev_code):
                 data["matches_left"] = 0
             save_keys()
             
-            # Reset target after match completes
+            # Match complete hone par target OFF ho jata hai
             if dev_code in ONLINE_DEVICES:
-                ONLINE_DEVICES[dev_code]["target"] = "OFF"
+                ONLINE_DEVICES[dev_code]["real_target"] = "OFF"
             break
 
 async def device_pruner():
@@ -144,18 +208,40 @@ async def device_pruner():
             ONLINE_DEVICES.pop(k, None)
         await asyncio.sleep(5)
 
+# Direct command sender (with guaranteed delivery & double-broadcast)
 async def send_command_to_room(room_id: str, command: str):
+    ws = ROOM_SOCKETS.get(room_id)
+    if ws is not None:
+        try:
+            payload_data = {
+                "topic": f"realtime:{room_id}",
+                "event": "broadcast",
+                "payload": {
+                    "type": "broadcast",
+                    "event": "dice",
+                    "payload": {"msg": command}
+                },
+                "ref": "cmd_ref"
+            }
+            await ws.send(json.dumps(payload_data))
+            await asyncio.sleep(0.1)
+            await ws.send(json.dumps(payload_data))
+            return
+        except Exception:
+            pass
+
+    # Fallback agar socket active na ho
     ws_url = SUPABASE_URL.replace("https://", "wss://") + f"/realtime/v1/websocket?apikey={SUPABASE_KEY}&vsn=1.0.0"
     try:
-        async with websockets.connect(ws_url) as ws:
-            await ws.send(json.dumps({
+        async with websockets.connect(ws_url) as fallback_ws:
+            await fallback_ws.send(json.dumps({
                 "topic": f"realtime:{room_id}",
                 "event": "phx_join",
-                "payload": {"config": {"broadcast": {"acknowledge_broadcasts": False}}},
+                "payload": {"config": {"broadcast": {"acknowledge_broadcasts": True}}},
                 "ref": "1"
             }))
             await asyncio.sleep(0.3)
-            await ws.send(json.dumps({
+            payload_data = {
                 "topic": f"realtime:{room_id}",
                 "event": "broadcast",
                 "payload": {
@@ -164,10 +250,19 @@ async def send_command_to_room(room_id: str, command: str):
                     "payload": {"msg": command}
                 },
                 "ref": "2"
-            }))
+            }
+            await fallback_ws.send(json.dumps(payload_data))
+            await asyncio.sleep(0.1)
+            await fallback_ws.send(json.dumps(payload_data))
             await asyncio.sleep(0.2)
     except Exception as e:
         print(f"[Supabase] Send Error: {e}")
+
+async def request_device_state(room_id: str):
+    ws = ROOM_SOCKETS.get(room_id)
+    if ws is not None:
+        await send_ping(ws, room_id)
+        await asyncio.sleep(0.4)
 
 def run_async_loop(loop):
     asyncio.set_event_loop(loop)
@@ -189,7 +284,9 @@ def build_dashboard(key):
     is_online = dev_code in ONLINE_DEVICES
     dev_info = ONLINE_DEVICES.get(dev_code, {})
     dev_name = dev_info.get("name", "Unknown Phone")
-    current_target = dev_info.get("target", "OFF")
+    
+    # Ye device se direct padhi hui actual state hai
+    current_target = dev_info.get("real_target", "OFF")
 
     status_icon = "🟢 Online" if is_online else "🔴 Offline"
 
@@ -198,7 +295,7 @@ def build_dashboard(key):
         f"🔑 *Device ID:* `{dev_code}`\n"
         f"📡 *Device Status:* {status_icon}\n"
         f"🎟 *Remaining Matches:* `{matches_left} / {total_matches}`\n"
-        f"🎯 *Active Target:* `{current_target}`\n\n"
+        f"🎯 *Active Target (From Device):* `{current_target}`\n\n"
         f"👑 *Choose Target Winner:*"
     )
 
@@ -310,6 +407,11 @@ def handle_start(message):
     if user_id in USER_SESSIONS:
         key = USER_SESSIONS[user_id]
         if key in ACTIVE_KEYS and ACTIVE_KEYS[key]["matches_left"] > 0:
+            dev_code = ACTIVE_KEYS[key]["dev_code"]
+            if dev_code in ONLINE_DEVICES:
+                room_id = ONLINE_DEVICES[dev_code]["room"]
+                asyncio.run_coroutine_threadsafe(request_device_state(room_id), async_loop)
+                time.sleep(0.3)
             txt, markup = build_dashboard(key)
             bot.send_message(message.chat.id, txt, reply_markup=markup)
             return
@@ -334,13 +436,19 @@ def handle_controller(call):
     dev_code = ACTIVE_KEYS[key]["dev_code"]
     data = call.data
 
+    # REFRESH: Device ko live PING bhejkar actual state mangwayega
     if data == "REFRESH_DASH":
+        if dev_code in ONLINE_DEVICES:
+            room_id = ONLINE_DEVICES[dev_code]["room"]
+            asyncio.run_coroutine_threadsafe(request_device_state(room_id), async_loop)
+            time.sleep(0.4)
+
         txt, markup = build_dashboard(key)
         try:
             bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
         except Exception:
             pass
-        bot.answer_callback_query(call.id, "Dashboard Refreshed")
+        bot.answer_callback_query(call.id, "Status synced from device!")
         return
 
     if data.startswith("SET_WIN|"):
@@ -352,9 +460,11 @@ def handle_controller(call):
         room_id = ONLINE_DEVICES[dev_code]["room"]
         command = f"PROTECT|{color}"
         
-        # Save active target
-        ONLINE_DEVICES[dev_code]["target"] = color.upper()
+        # Phone ko command bhejo aur sath me state sync karwao
         asyncio.run_coroutine_threadsafe(send_command_to_room(room_id, command), async_loop)
+        time.sleep(0.3)
+        asyncio.run_coroutine_threadsafe(request_device_state(room_id), async_loop)
+        time.sleep(0.3)
 
         bot.answer_callback_query(call.id, f"Winner Target: {color.upper()}", show_alert=True)
         txt, markup = build_dashboard(key)
@@ -376,6 +486,13 @@ def handle_text(message):
 
         USER_SESSIONS[user_id] = text
         bot.send_message(message.chat.id, "✅ Access Key Verified!")
+
+        dev_code = key_data["dev_code"]
+        if dev_code in ONLINE_DEVICES:
+            room_id = ONLINE_DEVICES[dev_code]["room"]
+            asyncio.run_coroutine_threadsafe(request_device_state(room_id), async_loop)
+            time.sleep(0.3)
+
         txt, markup = build_dashboard(text)
         bot.send_message(message.chat.id, txt, reply_markup=markup)
     else:
