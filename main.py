@@ -8,7 +8,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import websockets
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8482738540:AAH6HKd6704SPAn1q2ERWM8HGV0KxUpeyPk"
+BOT_TOKEN = "9037047335:AAG7V36wjrtgKryHqtIutHHfbJN0n2ezkeY"
 ADMIN_ID = 1431950109
 
 SUPABASE_URL = "https://llgkcdygplsqoiomqnah.supabase.co"
