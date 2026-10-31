@@ -1,13 +1,11 @@
-import asyncio
-import json
 import os
+import json
 import time
+import asyncio
+import threading
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import websockets
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, ContextTypes, filters
-)
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8482738540:AAH6HKd6704SPAn1q2ERWM8HGV0KxUpeyPk"
@@ -18,12 +16,14 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 KEYS_FILE = "keys_db.json"
 
-# Global runtime state
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# Global states
 ONLINE_DEVICES = {}  # dev_code: {"name": str, "room": str, "last_seen": timestamp}
 ACTIVE_KEYS = {}     # key_str: {"dev_code": str, "expires": timestamp}
 USER_SESSIONS = {}   # tg_user_id: key_str
 
-# ==================== PERSISTENT KEY STORAGE ====================
+# ==================== PERSISTENT STORAGE ====================
 def load_keys():
     global ACTIVE_KEYS
     if os.path.exists(KEYS_FILE):
@@ -40,7 +40,7 @@ def save_keys():
     except Exception:
         pass
 
-# ==================== SUPABASE LOBBY LISTENER ====================
+# ==================== SUPABASE BACKGROUND TASKS ====================
 async def supabase_lobby_listener():
     ws_url = SUPABASE_URL.replace("https://", "wss://") + f"/realtime/v1/websocket?apikey={SUPABASE_KEY}&vsn=1.0.0"
     while True:
@@ -63,7 +63,6 @@ async def supabase_lobby_listener():
                             inner_payload = payload.get("payload", {})
                             msg = inner_payload.get("msg", "")
 
-                            # Format: HOST|Model|room-xyz|DEV-ABCDEF
                             if inner_event == "host" and msg.startswith("HOST|"):
                                 parts = msg.split("|")
                                 if len(parts) >= 4:
@@ -87,7 +86,14 @@ async def supabase_lobby_listener():
         except Exception:
             await asyncio.sleep(3)
 
-# ==================== SUPABASE COMMAND DISPATCHER ====================
+async def device_pruner():
+    while True:
+        now = time.time()
+        stale = [k for k, v in ONLINE_DEVICES.items() if now - v["last_seen"] > 15]
+        for k in stale:
+            ONLINE_DEVICES.pop(k, None)
+        await asyncio.sleep(5)
+
 async def send_command_to_room(room_id: str, command: str):
     ws_url = SUPABASE_URL.replace("https://", "wss://") + f"/realtime/v1/websocket?apikey={SUPABASE_KEY}&vsn=1.0.0"
     try:
@@ -113,48 +119,19 @@ async def send_command_to_room(room_id: str, command: str):
     except Exception as e:
         print(f"[Supabase] Send Error: {e}")
 
-# ==================== HOUSEKEEPING ====================
-async def device_pruner():
-    while True:
-        now = time.time()
-        # 15 second inactive = drop
-        stale = [k for k, v in ONLINE_DEVICES.items() if now - v["last_seen"] > 15]
-        for k in stale:
-            ONLINE_DEVICES.pop(k, None)
-        await asyncio.sleep(5)
+def run_async_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.create_task(supabase_lobby_listener())
+    loop.create_task(device_pruner())
+    loop.run_forever()
 
-# ==================== USER BOT FLOW ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in USER_SESSIONS:
-        key = USER_SESSIONS[user_id]
-        if key in ACTIVE_KEYS and ACTIVE_KEYS[key]["expires"] > time.time():
-            await show_dashboard(update, context, key)
-            return
+# Background async thread start
+async_loop = asyncio.new_event_loop()
+t = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
+t.start()
 
-    await update.message.reply_text(
-        "👋 **LUDO CONTROL BOT**\n\n"
-        "Kripya apna **Access Key** paste karein:",
-        parse_mode="Markdown"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if text in ACTIVE_KEYS:
-        key_data = ACTIVE_KEYS[text]
-        if key_data["expires"] < time.time():
-            await update.message.reply_text("❌ Yeh Key expire ho chuki hai! Admin se naya key lein.")
-            return
-
-        USER_SESSIONS[user_id] = text
-        await update.message.reply_text("✅ Key Verified!")
-        await show_dashboard(update, context, text)
-    else:
-        await update.message.reply_text("❌ Invalid Key! Sahi key enter karein.")
-
-async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+# ==================== BOT HANDLERS ====================
+def build_dashboard(key):
     dev_code = ACTIVE_KEYS[key]["dev_code"]
     expires = ACTIVE_KEYS[key]["expires"]
     rem_min = max(0, int((expires - time.time()) // 60))
@@ -165,99 +142,71 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, key
     status_icon = "🟢 ONLINE" if is_online else "🔴 OFFLINE"
 
     text = (
-        f"📱 **Device:** `{dev_name}`\n"
-        f"🔑 **Code:** `{dev_code}`\n"
-        f"📡 **Status:** {status_icon}\n"
-        f"⏳ **Validity Left:** {rem_min} minutes\n\n"
-        f"👑 **Select Guaranteed Winner:**"
+        f"📱 *Device:* `{dev_name}`\n"
+        f"🔑 *Code:* `{dev_code}`\n"
+        f"📡 *Status:* {status_icon}\n"
+        f"⏳ *Validity Left:* {rem_min} minutes\n\n"
+        f"👑 *Select Guaranteed Winner:*"
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton("🔴 RED", callback_data="WIN|red"),
-            InlineKeyboardButton("🟡 YELLOW", callback_data="WIN|yellow")
-        ],
-        [
-            InlineKeyboardButton("🔵 BLUE", callback_data="WIN|blue"),
-            InlineKeyboardButton("🟢 GREEN", callback_data="WIN|green")
-        ],
-        [
-            InlineKeyboardButton("❌ WINNER OFF", callback_data="WIN|off")
-        ],
-        [
-            InlineKeyboardButton("🔄 REFRESH STATUS", callback_data="REFRESH")
-        ]
-    ]
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("🔴 RED", callback_data="WIN|red"),
+        InlineKeyboardButton("🟡 YELLOW", callback_data="WIN|yellow")
+    )
+    markup.row(
+        InlineKeyboardButton("🔵 BLUE", callback_data="WIN|blue"),
+        InlineKeyboardButton("🟢 GREEN", callback_data="WIN|green")
+    )
+    markup.row(InlineKeyboardButton("❌ WINNER OFF", callback_data="WIN|off"))
+    markup.row(InlineKeyboardButton("🔄 REFRESH STATUS", callback_data="REFRESH"))
+    return text, markup
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    if user_id not in USER_SESSIONS:
-        await query.edit_message_text("❌ Session expired. /start se dobara shuru karein.")
-        return
-
-    key = USER_SESSIONS[user_id]
-    if key not in ACTIVE_KEYS or ACTIVE_KEYS[key]["expires"] < time.time():
-        await query.edit_message_text("❌ Key Expire ho chuki hai.")
-        return
-
-    dev_code = ACTIVE_KEYS[key]["dev_code"]
-    data = query.data
-
-    if data == "REFRESH":
-        await show_dashboard(update, context, key)
-        return
-
-    if data.startswith("WIN|"):
-        color = data.split("|")[1]
-        if dev_code not in ONLINE_DEVICES:
-            await query.answer("⚠️ Device OFFLINE hai! Pehle phone me game kholiye.", show_alert=True)
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    user_id = message.from_user.id
+    if user_id in USER_SESSIONS:
+        key = USER_SESSIONS[user_id]
+        if key in ACTIVE_KEYS and ACTIVE_KEYS[key]["expires"] > time.time():
+            txt, markup = build_dashboard(key)
+            bot.send_message(message.chat.id, txt, reply_markup=markup)
             return
 
-        room_id = ONLINE_DEVICES[dev_code]["room"]
-        command = f"PROTECT|{color}"
-        asyncio.create_task(send_command_to_room(room_id, command))
+    bot.send_message(
+        message.chat.id,
+        "👋 *LUDO CONTROL BOT*\n\nKripya apna *Access Key* yahan paste karein:"
+    )
 
-        await query.answer(f"👑 Set Target Winner: {color.upper()}", show_alert=True)
-        await show_dashboard(update, context, key)
-
-# ==================== ADMIN PANEL ====================
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+@bot.message_handler(commands=['admin'])
+def handle_admin(message):
+    if message.from_user.id != ADMIN_ID:
         return
 
     now = time.time()
     if not ONLINE_DEVICES:
-        await update.message.reply_text("📱 **Koi bhi device online nahi hai.**")
+        bot.send_message(message.chat.id, "📱 *Koi bhi device online nahi hai.*")
         return
 
-    msg = "👑 **LIVE DETECTED DEVICES:**\n\n"
+    msg = "👑 *LIVE DETECTED DEVICES:*\n\n"
     for code, info in ONLINE_DEVICES.items():
         sec_ago = int(now - info["last_seen"])
-        msg += f"• **{info['name']}**\n  Code: `{code}`\n  Room: `{info['room']}`\n  Active: {sec_ago}s pehle\n\n"
+        msg += f"• *{info['name']}*\n  Code: `{code}`\n  Room: `{info['room']}`\n  Active: {sec_ago}s pehle\n\n"
 
     msg += "👉 Key generate karne ke liye:\n`/gen DEV-CODE 2h` (ya 30m, 1d)"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    bot.send_message(message.chat.id, msg)
 
-async def gen_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+@bot.message_handler(commands=['gen'])
+def handle_gen(message):
+    if message.from_user.id != ADMIN_ID:
         return
 
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Format: `/gen DEV-CODE 2h`\nExamples: `30m`, `2h`, `1d`", parse_mode="Markdown")
+    parts = message.text.strip().split()
+    if len(parts) < 3:
+        bot.send_message(message.chat.id, "Format: `/gen DEV-CODE 2h`\nExamples: `30m`, `2h`, `1d`")
         return
 
-    dev_code = args[0].strip()
-    dur_str = args[1].strip().lower()
+    dev_code = parts[1].strip()
+    dur_str = parts[2].strip().lower()
 
     mult = 3600
     if dur_str.endswith("m"):
@@ -278,32 +227,76 @@ async def gen_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_keys()
 
-    await update.message.reply_text(
-        f"✅ **Key Created!**\n\n"
+    bot.send_message(
+        message.chat.id,
+        f"✅ *Key Created!*\n\n"
         f"🔑 Key: `{key_str}`\n"
         f"📱 Device Code: `{dev_code}`\n"
         f"⏳ Validity: {dur_str}\n\n"
-        f"Yeh key user ko bhej do.",
-        parse_mode="Markdown"
+        f"Yeh key user ko bhej do."
     )
 
-# ==================== BOOTSTRAP ====================
-async def post_init(application):
-    load_keys()
-    asyncio.create_task(supabase_lobby_listener())
-    asyncio.create_task(device_pruner())
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    user_id = call.from_user.id
+    if user_id not in USER_SESSIONS:
+        bot.answer_callback_query(call.id, "Session expired! /start dabayein.", show_alert=True)
+        return
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    key = USER_SESSIONS[user_id]
+    if key not in ACTIVE_KEYS or ACTIVE_KEYS[key]["expires"] < time.time():
+        bot.answer_callback_query(call.id, "Key expire ho chuki hai!", show_alert=True)
+        return
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("gen", gen_key))
-    app.add_handler(CallbackQueryHandler(button_click))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    dev_code = ACTIVE_KEYS[key]["dev_code"]
+    data = call.data
 
-    print("🤖 Bot Online...")
-    app.run_polling()
+    if data == "REFRESH":
+        txt, markup = build_dashboard(key)
+        try:
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Refreshed!")
+        return
 
+    if data.startswith("WIN|"):
+        color = data.split("|")[1]
+        if dev_code not in ONLINE_DEVICES:
+            bot.answer_callback_query(call.id, "⚠️ Device OFFLINE hai! Pehle phone me game kholiye.", show_alert=True)
+            return
+
+        room_id = ONLINE_DEVICES[dev_code]["room"]
+        command = f"PROTECT|{color}"
+        asyncio.run_coroutine_threadsafe(send_command_to_room(room_id, command), async_loop)
+
+        bot.answer_callback_query(call.id, f"👑 Set Target Winner: {color.upper()}", show_alert=True)
+        txt, markup = build_dashboard(key)
+        try:
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        except Exception:
+            pass
+
+@bot.message_handler(func=lambda msg: True)
+def handle_text(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if text in ACTIVE_KEYS:
+        key_data = ACTIVE_KEYS[text]
+        if key_data["expires"] < time.time():
+            bot.send_message(message.chat.id, "❌ Yeh Key expire ho chuki hai! Admin se naya key lein.")
+            return
+
+        USER_SESSIONS[user_id] = text
+        bot.send_message(message.chat.id, "✅ Key Verified!")
+        txt, markup = build_dashboard(text)
+        bot.send_message(message.chat.id, txt, reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, "❌ Invalid Key! Sahi key enter karein.")
+
+# ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    main()
+    load_keys()
+    print("🤖 Bot Online...")
+    bot.infinity_polling()
