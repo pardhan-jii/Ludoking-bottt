@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import random
+import string
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,10 +21,18 @@ KEYS_FILE = "keys_db.json"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# Global states
+# Global runtime state
 ONLINE_DEVICES = {}  # dev_code: {"name": str, "room": str, "last_seen": timestamp}
 ACTIVE_KEYS = {}     # key_str: {"dev_code": str, "expires": timestamp}
 USER_SESSIONS = {}   # tg_user_id: key_str
+
+DURATIONS = {
+    "30m": ("30 Mins", 1800),
+    "1h":  ("1 Hour", 3600),
+    "2h":  ("2 Hours", 7200),
+    "1d":  ("1 Day", 86400),
+    "7d":  ("7 Days", 604800)
+}
 
 # ==================== RENDER HEALTH CHECK SERVER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -33,14 +43,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK - Bot is running")
 
     def log_message(self, format, *args):
-        # Console me logs flood na hon isliye suppress kiya
         return
 
 def run_health_server():
-    # Render environment variable se port uthayega, default 10000
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"🌐 Health check HTTP server running on port {port}")
     server.serve_forever()
 
 # ==================== PERSISTENT STORAGE ====================
@@ -83,6 +90,7 @@ async def supabase_lobby_listener():
                             inner_payload = payload.get("payload", {})
                             msg = inner_payload.get("msg", "")
 
+                            # Format: HOST|Model|room-xyz|DEV-ABCDEF
                             if inner_event == "host" and msg.startswith("HOST|"):
                                 parts = msg.split("|")
                                 if len(parts) >= 4:
@@ -145,7 +153,6 @@ def run_async_loop(loop):
     loop.create_task(device_pruner())
     loop.run_forever()
 
-# Background async thread start
 async_loop = asyncio.new_event_loop()
 t = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
 t.start()
@@ -182,6 +189,93 @@ def build_dashboard(key):
     markup.row(InlineKeyboardButton("🔄 REFRESH STATUS", callback_data="REFRESH"))
     return text, markup
 
+# ==================== ADMIN PANEL (BUTTON BASED) ====================
+@bot.message_handler(commands=['admin'])
+def handle_admin(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    now = time.time()
+    if not ONLINE_DEVICES:
+        bot.send_message(message.chat.id, "📱 *Koi bhi device online nahi hai abhi.*")
+        return
+
+    bot.send_message(message.chat.id, "👑 *LIVE DETECTED DEVICES:*")
+
+    for code, info in ONLINE_DEVICES.items():
+        sec_ago = int(now - info["last_seen"])
+        text = (
+            f"📱 *Phone:* `{info['name']}`\n"
+            f"🔑 *Code:* `{code}`\n"
+            f"📡 *Room:* `{info['room']}`\n"
+            f"⏱ *Active:* {sec_ago}s pehle"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton(f"🔑 Generate Key ({code})", callback_data=f"ASK_DUR|{code}"))
+        bot.send_message(message.chat.id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ASK_DUR|"))
+def callback_ask_duration(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Unauthorized!", show_alert=True)
+        return
+
+    dev_code = call.data.split("|")[1]
+    
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("30 Mins", callback_data=f"MAKE_KEY|{dev_code}|30m"),
+        InlineKeyboardButton("1 Hour",  callback_data=f"MAKE_KEY|{dev_code}|1h")
+    )
+    markup.row(
+        InlineKeyboardButton("2 Hours", callback_data=f"MAKE_KEY|{dev_code}|2h"),
+        InlineKeyboardButton("1 Day",   callback_data=f"MAKE_KEY|{dev_code}|1d")
+    )
+    markup.row(
+        InlineKeyboardButton("7 Days",  callback_data=f"MAKE_KEY|{dev_code}|7d")
+    )
+
+    bot.edit_message_text(
+        f"⏳ *Device:* `{dev_code}`\nKitne time ka access dena hai select karein:",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("MAKE_KEY|"))
+def callback_make_key(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Unauthorized!", show_alert=True)
+        return
+
+    parts = call.data.split("|")
+    dev_code = parts[1]
+    dur_tag = parts[2]
+
+    dur_label, duration_sec = DURATIONS.get(dur_tag, ("2 Hours", 7200))
+
+    salt = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    key_str = f"LUDO-{dur_tag.upper()}-{dev_code}-{salt}"
+
+    ACTIVE_KEYS[key_str] = {
+        "dev_code": dev_code,
+        "expires": time.time() + duration_sec
+    }
+    save_keys()
+
+    msg = (
+        f"✅ *Key Created Successfully!*\n\n"
+        f"🔑 Key: `{key_str}`\n"
+        f"📱 Device Code: `{dev_code}`\n"
+        f"⏳ Validity: {dur_label}\n\n"
+        f"👉 _Click karke copy karo aur user ko bhej do._"
+    )
+
+    bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id, "Key Generated!")
+
+# ==================== USER HANDLERS ====================
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     user_id = message.from_user.id
@@ -197,67 +291,8 @@ def handle_start(message):
         "👋 *LUDO CONTROL BOT*\n\nKripya apna *Access Key* yahan paste karein:"
     )
 
-@bot.message_handler(commands=['admin'])
-def handle_admin(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    now = time.time()
-    if not ONLINE_DEVICES:
-        bot.send_message(message.chat.id, "📱 *Koi bhi device online nahi hai.*")
-        return
-
-    msg = "👑 *LIVE DETECTED DEVICES:*\n\n"
-    for code, info in ONLINE_DEVICES.items():
-        sec_ago = int(now - info["last_seen"])
-        msg += f"• *{info['name']}*\n  Code: `{code}`\n  Room: `{info['room']}`\n  Active: {sec_ago}s pehle\n\n"
-
-    msg += "👉 Key generate karne ke liye:\n`/gen DEV-CODE 2h` (ya 30m, 1d)"
-    bot.send_message(message.chat.id, msg)
-
-@bot.message_handler(commands=['gen'])
-def handle_gen(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.strip().split()
-    if len(parts) < 3:
-        bot.send_message(message.chat.id, "Format: `/gen DEV-CODE 2h`\nExamples: `30m`, `2h`, `1d`")
-        return
-
-    dev_code = parts[1].strip()
-    dur_str = parts[2].strip().lower()
-
-    mult = 3600
-    if dur_str.endswith("m"):
-        mult = 60
-    elif dur_str.endswith("d"):
-        mult = 86400
-
-    try:
-        val = int(dur_str[:-1])
-        duration_sec = val * mult
-    except ValueError:
-        duration_sec = 7200
-
-    key_str = f"LUDO-{dur_str.upper()}-{dev_code}"
-    ACTIVE_KEYS[key_str] = {
-        "dev_code": dev_code,
-        "expires": time.time() + duration_sec
-    }
-    save_keys()
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ *Key Created!*\n\n"
-        f"🔑 Key: `{key_str}`\n"
-        f"📱 Device Code: `{dev_code}`\n"
-        f"⏳ Validity: {dur_str}\n\n"
-        f"Yeh key user ko bhej do."
-    )
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
+@bot.callback_query_handler(func=lambda call: call.data == "REFRESH" or call.data.startswith("WIN|"))
+def handle_controller_actions(call):
     user_id = call.from_user.id
     if user_id not in USER_SESSIONS:
         bot.answer_callback_query(call.id, "Session expired! /start dabayein.", show_alert=True)
@@ -319,10 +354,8 @@ def handle_text(message):
 if __name__ == "__main__":
     load_keys()
 
-    # 1. Start lightweight HTTP server for Render Web Service Port check
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    # 2. Start Telegram polling
     print("🤖 Bot Online...")
     bot.infinity_polling()
