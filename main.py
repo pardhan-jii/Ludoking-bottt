@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import websockets
@@ -22,6 +23,25 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 ONLINE_DEVICES = {}  # dev_code: {"name": str, "room": str, "last_seen": timestamp}
 ACTIVE_KEYS = {}     # key_str: {"dev_code": str, "expires": timestamp}
 USER_SESSIONS = {}   # tg_user_id: key_str
+
+# ==================== RENDER HEALTH CHECK SERVER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Bot is running")
+
+    def log_message(self, format, *args):
+        # Console me logs flood na hon isliye suppress kiya
+        return
+
+def run_health_server():
+    # Render environment variable se port uthayega, default 10000
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"🌐 Health check HTTP server running on port {port}")
+    server.serve_forever()
 
 # ==================== PERSISTENT STORAGE ====================
 def load_keys():
@@ -130,7 +150,7 @@ async_loop = asyncio.new_event_loop()
 t = threading.Thread(target=run_async_loop, args=(async_loop,), daemon=True)
 t.start()
 
-# ==================== BOT HANDLERS ====================
+# ==================== BOT UI / DASHBOARD ====================
 def build_dashboard(key):
     dev_code = ACTIVE_KEYS[key]["dev_code"]
     expires = ACTIVE_KEYS[key]["expires"]
@@ -298,5 +318,11 @@ def handle_text(message):
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     load_keys()
+
+    # 1. Start lightweight HTTP server for Render Web Service Port check
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
+    # 2. Start Telegram polling
     print("🤖 Bot Online...")
     bot.infinity_polling()
